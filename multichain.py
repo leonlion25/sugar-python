@@ -116,12 +116,16 @@ class MultiChainSugar:
                 
                 print(f"Fetching LPs from {chain}...")
                 
+                # Use count() for pagination ceiling
+                pool_count = sugar.lp.functions.count().call()
+                print(f"  {chain}: {pool_count} total pools", flush=True)
+                
                 # Paginated fetch with retry logic
                 all_lps = []
                 offset = 0
                 retries = 0
                 
-                while True:
+                while offset < pool_count:
                     try:
                         batch = sugar.lp.functions.all(limit, offset, 0).call()
                         
@@ -129,15 +133,11 @@ class MultiChainSugar:
                             break
                         
                         all_lps.extend(batch)
-                        print(f"  {chain}: fetched {len(all_lps)} pools (offset={offset})")
-                        
-                        if len(batch) < limit:
-                            # Last page
-                            break
+                        print(f"  {chain}: fetched {len(all_lps)} pools (offset={offset})", flush=True)
                         
                         offset += limit
-                        retries = 0  # Reset retries on success
-                        time.sleep(delay)  # Rate limit protection
+                        retries = 0
+                        time.sleep(delay)
                         
                     except Exception as e:
                         error_str = str(e).lower()
@@ -220,12 +220,15 @@ class MultiChainSugar:
                 
                 print(f"Fetching epochs from {chain}...")
                 
+                # Use lp.count() for pagination ceiling (epochs indexed by pool index)
+                pool_count = sugar.lp.functions.count().call()
+                
                 # Paginated fetch with retry logic
                 all_epochs = []
                 offset = 0
                 retries = 0
                 
-                while True:
+                while offset < pool_count:
                     try:
                         batch = sugar.rewards.functions.epochsLatest(limit, offset).call()
                         
@@ -233,11 +236,7 @@ class MultiChainSugar:
                             break
                         
                         all_epochs.extend(batch)
-                        print(f"  {chain}: fetched {len(all_epochs)} epochs (offset={offset})")
-                        
-                        if len(batch) < limit:
-                            # Last page
-                            break
+                        print(f"  {chain}: fetched {len(all_epochs)} epochs (offset={offset}/{pool_count})", flush=True)
                         
                         offset += limit
                         retries = 0
@@ -340,12 +339,47 @@ class MultiChainSugar:
         
         return prices
     
+    def _prefetch_decimals(self, tokens_by_chain: dict[str, set[str]]):
+        """Pre-fetch and cache decimals for all tokens to avoid rate limits during pricing."""
+        if not hasattr(self, '_decimals_cache'):
+            self._decimals_cache = {}
+        
+        for chain, tokens in tokens_by_chain.items():
+            sugar = self.sugars.get(chain)
+            if not sugar:
+                continue
+            
+            erc20_abi = '[{"inputs":[],"name":"decimals","outputs":[{"type":"uint8"}],"stateMutability":"view","type":"function"}]'
+            
+            uncached = [t for t in tokens if f"{chain}:{t}" not in self._decimals_cache]
+            if uncached:
+                print(f"  {chain}: fetching decimals for {len(uncached)} tokens...", flush=True)
+                for token_addr in uncached:
+                    cache_key = f"{chain}:{token_addr}"
+                    try:
+                        contract = sugar.w3.eth.contract(
+                            address=sugar.w3.to_checksum_address(token_addr),
+                            abi=erc20_abi
+                        )
+                        decimals = contract.functions.decimals().call()
+                        self._decimals_cache[cache_key] = decimals
+                    except Exception:
+                        # Retry once after brief pause (rate limit)
+                        try:
+                            time.sleep(0.5)
+                            decimals = contract.functions.decimals().call()
+                            self._decimals_cache[cache_key] = decimals
+                        except Exception:
+                            self._decimals_cache[cache_key] = 18  # Last resort default
+    
     def fetch_token_prices(self, df: pd.DataFrame) -> dict[str, dict[str, float]]:
         """
         Fetch token prices using:
         1. Spot price oracle (1inch) - primary
         2. DeFiLlama API - fallback
         3. $0 for unknown tokens
+        
+        Also pre-fetches token decimals for all tokens.
         
         Args:
             df: DataFrame with bribes/fees columns containing token addresses
@@ -366,6 +400,9 @@ class MultiChainSugar:
                     for token_addr, amount in row[col]:
                         if token_addr and token_addr != "0x0000000000000000000000000000000000000000":
                             tokens_by_chain[chain].add(token_addr.lower())
+        
+        # Pre-fetch all decimals first (avoids rate limits during pricing)
+        self._prefetch_decimals(tokens_by_chain)
         
         prices: dict[str, dict[str, float]] = {}
         
