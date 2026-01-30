@@ -340,7 +340,10 @@ class MultiChainSugar:
         return prices
     
     def _prefetch_decimals(self, tokens_by_chain: dict[str, set[str]]):
-        """Pre-fetch and cache decimals for all tokens to avoid rate limits during pricing."""
+        """
+        Pre-fetch and cache decimals for all tokens using Sugar's lp_tokens().
+        Falls back to individual ERC20 calls only for tokens not found in Sugar.
+        """
         if not hasattr(self, '_decimals_cache'):
             self._decimals_cache = {}
         
@@ -349,28 +352,39 @@ class MultiChainSugar:
             if not sugar:
                 continue
             
-            erc20_abi = '[{"inputs":[],"name":"decimals","outputs":[{"type":"uint8"}],"stateMutability":"view","type":"function"}]'
-            
             uncached = [t for t in tokens if f"{chain}:{t}" not in self._decimals_cache]
-            if uncached:
-                print(f"  {chain}: fetching decimals for {len(uncached)} tokens...", flush=True)
-                for token_addr in uncached:
+            if not uncached:
+                continue
+            
+            # Use Sugar's lp_tokens() to get decimals in bulk (single paginated call)
+            print(f"  {chain}: fetching token decimals via lp_tokens()...", flush=True)
+            try:
+                token_data = sugar.lp_tokens(listed=False, override=True)
+                for addr in uncached:
+                    cache_key = f"{chain}:{addr}"
+                    addr_checksum = sugar.w3.to_checksum_address(addr)
+                    if addr_checksum in token_data.index:
+                        self._decimals_cache[cache_key] = int(token_data.loc[addr_checksum, "decimals"])
+                    elif addr in token_data.index:
+                        self._decimals_cache[cache_key] = int(token_data.loc[addr, "decimals"])
+            except Exception as e:
+                print(f"  {chain}: lp_tokens() failed: {e}", flush=True)
+            
+            # Fallback: individual ERC20 calls for any still missing
+            still_missing = [t for t in uncached if f"{chain}:{t}" not in self._decimals_cache]
+            if still_missing:
+                print(f"  {chain}: {len(still_missing)} tokens not in Sugar, fetching via ERC20...", flush=True)
+                erc20_abi = '[{"inputs":[],"name":"decimals","outputs":[{"type":"uint8"}],"stateMutability":"view","type":"function"}]'
+                for token_addr in still_missing:
                     cache_key = f"{chain}:{token_addr}"
                     try:
                         contract = sugar.w3.eth.contract(
                             address=sugar.w3.to_checksum_address(token_addr),
                             abi=erc20_abi
                         )
-                        decimals = contract.functions.decimals().call()
-                        self._decimals_cache[cache_key] = decimals
+                        self._decimals_cache[cache_key] = contract.functions.decimals().call()
                     except Exception:
-                        # Retry once after brief pause (rate limit)
-                        try:
-                            time.sleep(0.5)
-                            decimals = contract.functions.decimals().call()
-                            self._decimals_cache[cache_key] = decimals
-                        except Exception:
-                            self._decimals_cache[cache_key] = 18  # Last resort default
+                        self._decimals_cache[cache_key] = 18  # Last resort default
     
     def fetch_token_prices(self, df: pd.DataFrame) -> dict[str, dict[str, float]]:
         """
